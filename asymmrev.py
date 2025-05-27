@@ -299,7 +299,15 @@ class AsymmetricReversibleBlock(nn.Module):
         #     enable_amp=enable_amp
         # )
 
-        self.F = TokenMixerFBlockC2V(
+        # self.F = TokenMixerFBlockC2V(
+        #     dim_c=dim_c,
+        #     dim_v=dim_v,
+        #     patches_shape=const_patches_shape,
+        #     token_pool_size=token_map_pool_size,
+        #     enable_amp=enable_amp
+        # )
+
+        self.F = GMLPSpatialGatingUnit(
             dim_c=dim_c,
             dim_v=dim_v,
             patches_shape=const_patches_shape,
@@ -654,7 +662,130 @@ class TokenMixerFBlockC2V(nn.Module):
             x = self.token_mixer(x).transpose(1, 2)
 
             return x
-        
+
+#Without Circulant Matrix
+class GMLPSpatialGatingUnit(nn.Module):
+    def __init__(self, dim_c,dim_v,patches_shape,token_pool_size,enable_amp=False,):
+        super().__init__()
+
+        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
+
+        dim_out = dim_v // 2
+        self.norm = nn.LayerNorm(dim_out, eps=1e-6, elementwise_affine=True)
+
+        self.dim_c, self.dim_v = dim_c, dim_v
+        self.patches_shape = patches_shape
+        self.token_pool_size = token_pool_size
+        self.N_v = (self.patches_shape[0]//token_pool_size) * (self.patches_shape[1]//token_pool_size)
+        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
+        self.spatial_proj = nn.Linear(self.N_v, self.N_v)
+        self.channel_proj = nn.Linear(dim_out, dim_v)
+        self.enable_amp = enable_amp
+
+    def forward(self, x):
+        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+            B, N, d_c = x.shape
+
+            x = self.norm_input(x)    
+
+            x = x.transpose(1,2)
+            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
+            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
+
+            res, gate = x.chunk(2, dim = -1)    # instead of splitting into two parts we can apply on x directly
+            gate = self.norm(gate)
+            gate = self.spatial_proj(gate)
+            x = res * gate
+
+            x = self.channel_proj(x)
+
+            x = x.transpose(1, 2)
+            return x
+
+# With Circulant Matrix
+# class SpatialGatingUnit(nn.Module):
+#     def __init__(
+#         self,
+#         dim,
+#         dim_seq,
+#         causal=False,
+#         act=nn.Identity(),
+#         heads=1,
+#         init_eps=1e-3,
+#         circulant_matrix=False
+#     ):
+#         super().__init__()
+#         assert dim % 2 == 0, "Input dimension must be even."
+
+#         self.dim = dim
+#         self.dim_half = dim // 2
+#         self.dim_seq = dim_seq
+#         self.heads = heads
+#         self.causal = causal
+#         self.act = act
+#         self.circulant_matrix = circulant_matrix
+
+#         self.norm = nn.LayerNorm(self.dim_half)
+
+#         if circulant_matrix:
+#             self.circulant_pos_x = nn.Parameter(torch.ones(heads, dim_seq))
+#             self.circulant_pos_y = nn.Parameter(torch.ones(heads, dim_seq))
+
+#         shape = (heads, dim_seq, dim_seq) if not circulant_matrix else (heads, dim_seq)
+#         weight = torch.zeros(shape)
+#         self.weight = nn.Parameter(weight)
+#         bound = init_eps / dim_seq
+#         nn.init.uniform_(self.weight, -bound, bound)
+
+#         self.bias = nn.Parameter(torch.ones(heads, dim_seq))
+
+#     def forward(self, x: torch.Tensor, gate_res: torch.Tensor = None) -> torch.Tensor:
+#         B, N, D = x.shape
+#         res, gate = torch.chunk(x, 2, dim=-1)  # (B, N, D/2)
+
+#         gate = self.norm(gate)
+
+#         weight = self.weight
+#         bias = self.bias
+
+#         if self.circulant_matrix:
+#             seq = self.dim_seq
+#             # Step 1: pad and repeat
+#             w = F.pad(weight, (0, seq), value=0)  # (heads, seq + seq)
+#             w = w.unsqueeze(2).repeat(1, 1, seq)  # (heads, seq + seq, seq)
+#             w = w[:, :seq, :]  # truncate
+#             # Step 2: apply position-dependent scaling
+#             w = w * self.circulant_pos_x.unsqueeze(2)  # (heads, seq, 1)
+#             w = w * self.circulant_pos_y.unsqueeze(1)  # (heads, 1, seq)
+#             weight = w  # (heads, seq, seq)
+
+#         if self.causal:
+#             weight = weight[:, :N, :N]
+#             bias = bias[:, :N]
+#             mask = torch.triu(torch.ones(N, N, device=x.device), diagonal=1).bool()
+#             weight = weight.masked_fill(mask.unsqueeze(0), 0.)
+
+#         # reshape gate: (B, N, D/2) → (B, heads, N, D_head)
+#         D_head = self.dim_half // self.heads
+#         gate = gate.view(B, N, self.heads, D_head).permute(0, 2, 1, 3)  # (B, heads, N, D_head)
+
+#         # apply weight: for each head
+#         output = torch.zeros_like(gate)
+#         for h in range(self.heads):
+#             W_h = weight[h]  # (N, N)
+#             b_h = bias[h].unsqueeze(1)  # (N, 1)
+#             g_h = gate[:, h]  # (B, N, D_head)
+#             mixed = torch.matmul(W_h, g_h.transpose(1, 2))  # (B, N, D_head)
+#             mixed = mixed.transpose(1, 2) + b_h.unsqueeze(0)  # (B, D_head, N) → (B, N, D_head)
+#             output[:, h] = mixed
+
+#         # merge heads: (B, heads, N, D_head) → (B, N, D/2)
+#         gate = output.permute(0, 2, 1, 3).contiguous().view(B, N, self.dim_half)
+
+#         if gate_res is not None:
+#             gate = gate + gate_res
+
+#         return self.act(gate) * res
 
 class VarStreamDownSamplingBlock(nn.Module):
     """
