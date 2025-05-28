@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 # Needed to implement custom backward pass
 from torch.autograd import Function as Function
 
@@ -307,6 +307,13 @@ class AsymmetricReversibleBlock(nn.Module):
         #     enable_amp=enable_amp
         # )
 
+        # self.F = GMLPSpatialGatingUnitWOSplit(
+        #     dim_c=dim_c,
+        #     dim_v=dim_v,
+        #     patches_shape=const_patches_shape,
+        #     token_pool_size=token_map_pool_size,
+        #     enable_amp=enable_amp
+        # )
         self.F = GMLPSpatialGatingUnit(
             dim_c=dim_c,
             dim_v=dim_v,
@@ -314,6 +321,14 @@ class AsymmetricReversibleBlock(nn.Module):
             token_pool_size=token_map_pool_size,
             enable_amp=enable_amp
         )
+
+        # self.F = GMLPSpatialGatingUnitCirculant(
+        #     dim_c=dim_c,
+        #     dim_v=dim_v,
+        #     patches_shape=const_patches_shape,
+        #     token_pool_size=token_map_pool_size,
+        #     enable_amp=enable_amp
+        # )
 
         self.G = MLPSubblockV2C(
             dim_c=dim_c,
@@ -663,14 +678,53 @@ class TokenMixerFBlockC2V(nn.Module):
 
             return x
 
-#Without Circulant Matrix
-class GMLPSpatialGatingUnit(nn.Module):
+#Without Circulant Matrix and Without Splitting X
+class GMLPSpatialGatingUnitWOSplit(nn.Module):
     def __init__(self, dim_c,dim_v,patches_shape,token_pool_size,enable_amp=False,):
         super().__init__()
 
         self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
+        self.norm = nn.LayerNorm(dim_v, eps=1e-6, elementwise_affine=True)
+
+        self.dim_c, self.dim_v = dim_c, dim_v
+        self.patches_shape = patches_shape
+        self.token_pool_size = token_pool_size
+        self.N_v = (self.patches_shape[0]//token_pool_size) * (self.patches_shape[1]//token_pool_size)
+        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
+        self.spatial_proj = nn.Linear(self.N_v, self.N_v)
+        # self.channel_proj = nn.Linear(dim_v, dim_v)
+        self.enable_amp = enable_amp
+
+    def forward(self, x):
+        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+            B, N, d_c = x.shape
+
+            x = self.norm_input(x)    
+
+            x = x.transpose(1,2)
+            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
+            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
+            x = x.transpose(1, 2)
+
+            res = x
+            gate = x # instead of splitting into two parts applying on x directly
+            gate = self.norm(gate)
+            gate = gate.transpose(1,2)
+            gate = self.spatial_proj(gate)
+            gate = gate.transpose(1,2)
+            x = res * gate
+
+            # x = self.channel_proj(x)
+            return x
+        
+#Without Circulant Matrix and With Splitting X
+class GMLPSpatialGatingUnit(nn.Module):
+    def __init__(self, dim_c,dim_v,patches_shape,token_pool_size,enable_amp=False,):
+        super().__init__()
 
         dim_out = dim_v // 2
+
+        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
         self.norm = nn.LayerNorm(dim_out, eps=1e-6, elementwise_affine=True)
 
         self.dim_c, self.dim_v = dim_c, dim_v
@@ -703,91 +757,69 @@ class GMLPSpatialGatingUnit(nn.Module):
             x = self.channel_proj(x)
 
             return x
+        
+# With Circulant Matrix and Splitting X
+class GMLPSpatialGatingUnitCirculant(nn.Module):
+    def __init__(self, dim_c, dim_v, patches_shape, token_pool_size, enable_amp=False):
+        super().__init__()
 
-# With Circulant Matrix
-# class SpatialGatingUnit(nn.Module):
-#     def __init__(
-#         self,
-#         dim,
-#         dim_seq,
-#         causal=False,
-#         act=nn.Identity(),
-#         heads=1,
-#         init_eps=1e-3,
-#         circulant_matrix=False
-#     ):
-#         super().__init__()
-#         assert dim % 2 == 0, "Input dimension must be even."
+        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
 
-#         self.dim = dim
-#         self.dim_half = dim // 2
-#         self.dim_seq = dim_seq
-#         self.heads = heads
-#         self.causal = causal
-#         self.act = act
-#         self.circulant_matrix = circulant_matrix
+        dim_out = dim_v // 2
+        self.norm = nn.LayerNorm(dim_out, eps=1e-6, elementwise_affine=True)
 
-#         self.norm = nn.LayerNorm(self.dim_half)
+        self.dim_c = dim_c
+        self.dim_v = dim_v
+        self.patches_shape = patches_shape
+        self.token_pool_size = token_pool_size
+        self.N_v = (patches_shape[0] // token_pool_size) * (patches_shape[1] // token_pool_size)
 
-#         if circulant_matrix:
-#             self.circulant_pos_x = nn.Parameter(torch.ones(heads, dim_seq))
-#             self.circulant_pos_y = nn.Parameter(torch.ones(heads, dim_seq))
+        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
 
-#         shape = (heads, dim_seq, dim_seq) if not circulant_matrix else (heads, dim_seq)
-#         weight = torch.zeros(shape)
-#         self.weight = nn.Parameter(weight)
-#         bound = init_eps / dim_seq
-#         nn.init.uniform_(self.weight, -bound, bound)
+        # Circulant projection
+        self.circulant_pos_x = nn.Parameter(torch.ones(self.N_v))
+        self.circulant_pos_y = nn.Parameter(torch.ones(self.N_v))
+        self.weight = nn.Parameter(torch.empty(self.N_v))
+        self.bias = nn.Parameter(torch.ones(self.N_v))
 
-#         self.bias = nn.Parameter(torch.ones(heads, dim_seq))
+        nn.init.uniform_(self.weight, -1e-3 / self.N_v, 1e-3 / self.N_v)
 
-#     def forward(self, x: torch.Tensor, gate_res: torch.Tensor = None) -> torch.Tensor:
-#         B, N, D = x.shape
-#         res, gate = torch.chunk(x, 2, dim=-1)  # (B, N, D/2)
+        self.channel_proj = nn.Linear(dim_out, dim_v)
+        self.enable_amp = enable_amp
 
-#         gate = self.norm(gate)
+    def forward(self, x):
+        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+            B, N_in, _ = x.shape
 
-#         weight = self.weight
-#         bias = self.bias
+            # Normalize input
+            x = self.norm_input(x)  # (B, N_in, dim_c)
 
-#         if self.circulant_matrix:
-#             seq = self.dim_seq
-#             # Step 1: pad and repeat
-#             w = F.pad(weight, (0, seq), value=0)  # (heads, seq + seq)
-#             w = w.unsqueeze(2).repeat(1, 1, seq)  # (heads, seq + seq, seq)
-#             w = w[:, :seq, :]  # truncate
-#             # Step 2: apply position-dependent scaling
-#             w = w * self.circulant_pos_x.unsqueeze(2)  # (heads, seq, 1)
-#             w = w * self.circulant_pos_y.unsqueeze(1)  # (heads, 1, seq)
-#             weight = w  # (heads, seq, seq)
+            # (B, dim_c, H, W)
+            x = x.transpose(1, 2)
+            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
+            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
+            x = x.transpose(1, 2)  # (B, N_v, dim_v)
 
-#         if self.causal:
-#             weight = weight[:, :N, :N]
-#             bias = bias[:, :N]
-#             mask = torch.triu(torch.ones(N, N, device=x.device), diagonal=1).bool()
-#             weight = weight.masked_fill(mask.unsqueeze(0), 0.)
+            res, gate = x.chunk(2, dim=-1)  # Each is (B, N_v, dim_out)
 
-#         # reshape gate: (B, N, D/2) → (B, heads, N, D_head)
-#         D_head = self.dim_half // self.heads
-#         gate = gate.view(B, N, self.heads, D_head).permute(0, 2, 1, 3)  # (B, heads, N, D_head)
+            gate = self.norm(gate)  # (B, N_v, dim_out)
 
-#         # apply weight: for each head
-#         output = torch.zeros_like(gate)
-#         for h in range(self.heads):
-#             W_h = weight[h]  # (N, N)
-#             b_h = bias[h].unsqueeze(1)  # (N, 1)
-#             g_h = gate[:, h]  # (B, N, D_head)
-#             mixed = torch.matmul(W_h, g_h.transpose(1, 2))  # (B, N, D_head)
-#             mixed = mixed.transpose(1, 2) + b_h.unsqueeze(0)  # (B, D_head, N) → (B, N, D_head)
-#             output[:, h] = mixed
+            # Circulant matrix logic
+            w = F.pad(self.weight, (0, self.N_v), value=0)  # (2*N_v)
+            w = w.unsqueeze(0).repeat(self.N_v, 1)  # (N_v, 2*N_v)
+            w = w[:, :self.N_v]  # (N_v, N_v)
+            w = w * self.circulant_pos_x.unsqueeze(1)  # (N_v, N_v)
+            w = w * self.circulant_pos_y.unsqueeze(0)  # (N_v, N_v)
 
-#         # merge heads: (B, heads, N, D_head) → (B, N, D/2)
-#         gate = output.permute(0, 2, 1, 3).contiguous().view(B, N, self.dim_half)
+            # Apply circulant projection: gate is (B, N_v, dim_out)
+            gate = gate.transpose(1, 2)  # (B, dim_out, N_v)
+            gate = torch.matmul(gate, w.T) + self.bias  # (B, dim_out, N_v)
+            gate = gate.transpose(1, 2)  # (B, N_v, dim_out)
 
-#         if gate_res is not None:
-#             gate = gate + gate_res
+            x = res * gate  # element-wise
+            x = self.channel_proj(x)  # (B, N_v, dim_v)
 
-#         return self.act(gate) * res
+            return x
 
 class VarStreamDownSamplingBlock(nn.Module):
     """
