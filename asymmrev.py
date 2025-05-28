@@ -691,15 +691,17 @@ class GMLPSpatialGatingUnit(nn.Module):
             x = x.transpose(1,2)
             x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
             x = self.conv(x).reshape(B, self.dim_v, self.N_v)
+            x = x.transpose(1, 2)
 
             res, gate = x.chunk(2, dim = -1)    # instead of splitting into two parts we can apply on x directly
             gate = self.norm(gate)
+            gate = gate.transpose(1,2)
             gate = self.spatial_proj(gate)
+            gate = gate.transpose(1,2)
             x = res * gate
 
             x = self.channel_proj(x)
 
-            x = x.transpose(1, 2)
             return x
 
 # With Circulant Matrix
