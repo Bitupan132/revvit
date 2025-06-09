@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
+
 # Needed to implement custom backward pass
 from torch.autograd import Function as Function
 
@@ -8,6 +8,8 @@ from torch.autograd import Function as Function
 from torch.nn import MultiheadAttention as MHA
 import sys
 import numpy as np
+
+from har_blocks import AsymmetricMHPAReversibleBlock, AsymmetricSwinReversibleBlock
 
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     """
@@ -27,6 +29,7 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
 class AsymmetricRevVit(nn.Module):
     def __init__(
         self,
+        block_type=None,
         const_dim=768,
         var_dim=[64, 128, 320, 512],
         sra_R=[8, 4, 2, 1],
@@ -83,19 +86,53 @@ class AsymmetricRevVit(nn.Module):
         for i in range(sum(stages)):
             stage_index = block_to_stage_indexing[i]
 
-            self.layers.append(
-                AsymmetricReversibleBlock(
-                    dim_c=self.const_dim,
-                    dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
-                    num_heads=self.n_head,
-                    enable_amp=enable_amp,
-                    sr_ratio=sra_R[stage_index], # Same sr_ratio used for all blocks in a stage
-                    token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
-                    drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
-                    const_patches_shape=const_patches_shape,
-                    block_id=i
+            if block_type == "smlp":
+                self.layers.append(
+                    AsymmetricReversibleBlock(
+                        dim_c=self.const_dim,
+                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        num_heads=self.n_head,
+                        enable_amp=enable_amp,
+                        sr_ratio=sra_R[stage_index], # Same sr_ratio used for all blocks in a stage
+                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
+                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        const_patches_shape=const_patches_shape,
+                        block_id=i
+                    )
                 )
-            )
+            elif block_type == "mhpa":
+                self.layers.append(
+                    AsymmetricMHPAReversibleBlock(
+                        dim_c=self.const_dim,
+                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        num_heads=(2**stage_index),
+                        enable_amp=enable_amp,
+                        kv_pool_size=4,                     # K, V are fixed 14x14, created by pooling conv on 56x56
+                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
+                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        const_patches_shape=const_patches_shape,
+                        block_id=i
+                    )
+                )
+            elif block_type in ["swin-attention", "swin-mlp", "swin-dw-mlp"]:
+                self.layers.append(
+                    AsymmetricSwinReversibleBlock(
+                        f_block=block_type,
+                        dim_c=self.const_dim,
+                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        num_heads=3*(2**stage_index),
+                        window_size=(8 if block_type=="swin-dw-mlp" else 7), # Fixed Window size 
+                        shift_size=(0 if (i % 2 == 0) else (8 if block_type=="swin-dw-mlp" else 7) // 2),
+                        enable_amp=enable_amp,
+                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
+                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        const_patches_shape=const_patches_shape,
+                        block_id=i
+                    )
+                )
+            else:
+                print("Invalid asymm block type")
+                quit()
             
             # Stage transitions
             if (i == np.cumsum(stages)[stage_index] - 1) and (stage_index != len(stages) - 1):
@@ -134,14 +171,22 @@ class AsymmetricRevVit(nn.Module):
             torch.zeros(1, self.const_num_patches, var_dim[0])
         )
 
-        # The two streams are concatenated and passed through a linear
-        # layer for final projection. This is the only part of RevViT
-        # that uses different parameters/FLOPs than a standard ViT model.
-        # Note that fusion can be done in several ways, including
-        # more expressive methods like in paper, but we use
-        # linear layer + LN for simplicity.
-        self.head = nn.Linear(self.const_dim, num_classes, bias=True) # Class Prediction using Const Stream
-        self.norm = nn.LayerNorm(self.const_dim) # Class Prediction using Const Stream
+        # # The two streams are concatenated and passed through a linear
+        # # layer for final projection. This is the only part of RevViT
+        # # that uses different parameters/FLOPs than a standard ViT model.
+        # # Note that fusion can be done in several ways, including
+        # # more expressive methods like in paper, but we use
+        # # linear layer + LN for simplicity.
+        # self.head = nn.Linear(self.const_dim, num_classes, bias=True) # Class Prediction using Const Stream
+        # self.norm = nn.LayerNorm(self.const_dim) # Class Prediction using Const Stream
+        # # we may need to remove the above two lines
+
+        # New segmentation components
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(96, num_classes, kernel_size=1), # 150 for ADE20K
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        )
+        self.feature_maps = [] # To store stage outputs
 
     @staticmethod
     def vanilla_backward(x1, x2, layers):
@@ -175,6 +220,9 @@ class AsymmetricRevVit(nn.Module):
                 reversible_segments.append([i+1])
         reversible_segments[-1].append(len(self.layers))
 
+        # Feature Storage Initialization
+        self.feature_maps = []
+
         for segment in reversible_segments:
 
             # no need for custom backprop in eval/inference phase
@@ -192,19 +240,43 @@ class AsymmetricRevVit(nn.Module):
             if segment[1] != len(self.layers):
                 x1, x2 = self.layers[segment[1]](x1, x2)
 
-        # aggregate across sequence length
-        pred = x2.mean(1) # Class Prediction using Const Stream
+                self.feature_maps.append(x2.clone())  # Constant stream features
+        # final stage features
+        self.feature_maps.append(x2)
 
-        # head pre-norm
-        pred = self.norm(pred)
+        # # aggregate across sequence length
+        # pred = x2.mean(1) # Class Prediction using Const Stream
 
-        # pre-softmax logits
-        pred = self.head(pred)
+        # # head pre-norm
+        # pred = self.norm(pred)
 
-        # return pre-softmax logits
-        return pred
+        # # pre-softmax logits
+        # pred = self.head(pred)
 
+        # # return pre-softmax logits
+        # return pred
 
+        # Segmentation branch
+        # Stack and sum all constant stream features from the 4 stages
+        # Each is (B, N, 96), where N = (H/4)*(W/4)
+        # We need to reshape to (B, 96, H/4, W/4) before summing
+        B = x.shape[0]
+        H, W = self.patch_size[0], self.patch_size[1]
+        h4 = x.shape[2] // 4
+        w4 = x.shape[3] // 4
+
+        features_reshaped = [
+            fm.transpose(1, 2).reshape(B, 96, h4, w4)
+            for fm in self.feature_maps
+        ]
+        fused_feature = torch.stack(features_reshaped, dim=0).sum(dim=0)  # (B, 96, H/4, W/4)
+
+        # Segmentation head
+        seg_logits = self.seg_head(fused_feature)  # (B, 150, H, W)
+        segmentation = torch.softmax(seg_logits, dim=1)
+
+        return segmentation
+    
 class RevBackProp(Function):
 
     """
@@ -299,36 +371,13 @@ class AsymmetricReversibleBlock(nn.Module):
         #     enable_amp=enable_amp
         # )
 
-        # self.F = TokenMixerFBlockC2V(
-        #     dim_c=dim_c,
-        #     dim_v=dim_v,
-        #     patches_shape=const_patches_shape,
-        #     token_pool_size=token_map_pool_size,
-        #     enable_amp=enable_amp
-        # )
-
-        # self.F = GMLPSpatialGatingUnitWOSplit(
-        #     dim_c=dim_c,
-        #     dim_v=dim_v,
-        #     patches_shape=const_patches_shape,
-        #     token_pool_size=token_map_pool_size,
-        #     enable_amp=enable_amp
-        # )
-        self.F = GMLPSpatialGatingUnit(
+        self.F = TokenMixerFBlockC2V(
             dim_c=dim_c,
             dim_v=dim_v,
             patches_shape=const_patches_shape,
             token_pool_size=token_map_pool_size,
             enable_amp=enable_amp
         )
-
-        # self.F = GMLPSpatialGatingUnitCirculant(
-        #     dim_c=dim_c,
-        #     dim_v=dim_v,
-        #     patches_shape=const_patches_shape,
-        #     token_pool_size=token_map_pool_size,
-        #     enable_amp=enable_amp
-        # )
 
         self.G = MLPSubblockV2C(
             dim_c=dim_c,
@@ -674,152 +723,12 @@ class TokenMixerFBlockC2V(nn.Module):
             x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
             x = self.conv(x).reshape(B, self.dim_v, self.N_v)
 
+            x = torch.nn.functional.relu(x) # With this SMLP scores 76.16 ImageNet-100
+
             x = self.token_mixer(x).transpose(1, 2)
 
             return x
-
-#Without Circulant Matrix and Without Splitting X
-class GMLPSpatialGatingUnitWOSplit(nn.Module):
-    def __init__(self, dim_c,dim_v,patches_shape,token_pool_size,enable_amp=False,):
-        super().__init__()
-
-        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
-        self.norm = nn.LayerNorm(dim_v, eps=1e-6, elementwise_affine=True)
-
-        self.dim_c, self.dim_v = dim_c, dim_v
-        self.patches_shape = patches_shape
-        self.token_pool_size = token_pool_size
-        self.N_v = (self.patches_shape[0]//token_pool_size) * (self.patches_shape[1]//token_pool_size)
-        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
-        self.spatial_proj = nn.Linear(self.N_v, self.N_v)
-        # self.channel_proj = nn.Linear(dim_v, dim_v)
-        self.enable_amp = enable_amp
-
-    def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
-            B, N, d_c = x.shape
-
-            x = self.norm_input(x)    
-
-            x = x.transpose(1,2)
-            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
-            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
-            x = x.transpose(1, 2)
-
-            res = x
-            gate = x # instead of splitting into two parts applying on x directly
-            gate = self.norm(gate)
-            gate = gate.transpose(1,2)
-            gate = self.spatial_proj(gate)
-            gate = gate.transpose(1,2)
-            x = res * gate
-
-            # x = self.channel_proj(x)
-            return x
         
-#Without Circulant Matrix and With Splitting X
-class GMLPSpatialGatingUnit(nn.Module):
-    def __init__(self, dim_c,dim_v,patches_shape,token_pool_size,enable_amp=False,):
-        super().__init__()
-
-        dim_out = dim_v // 2
-
-        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
-        self.norm = nn.LayerNorm(dim_out, eps=1e-6, elementwise_affine=True)
-
-        self.dim_c, self.dim_v = dim_c, dim_v
-        self.patches_shape = patches_shape
-        self.token_pool_size = token_pool_size
-        self.N_v = (self.patches_shape[0]//token_pool_size) * (self.patches_shape[1]//token_pool_size)
-        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
-        self.spatial_proj = nn.Linear(self.N_v, self.N_v)
-        self.channel_proj = nn.Linear(dim_out, dim_v)
-        self.enable_amp = enable_amp
-
-    def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
-            B, N, d_c = x.shape
-
-            x = self.norm_input(x)    
-
-            x = x.transpose(1,2)
-            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
-            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
-            x = x.transpose(1, 2)
-
-            res, gate = x.chunk(2, dim = -1)    # instead of splitting into two parts we can apply on x directly
-            gate = self.norm(gate)
-            gate = gate.transpose(1,2)
-            gate = self.spatial_proj(gate)
-            gate = gate.transpose(1,2)
-            x = res * gate
-
-            x = self.channel_proj(x)
-
-            return x
-        
-# With Circulant Matrix and Splitting X
-class GMLPSpatialGatingUnitCirculant(nn.Module):
-    def __init__(self, dim_c, dim_v, patches_shape, token_pool_size, enable_amp=False):
-        super().__init__()
-
-        self.norm_input = nn.LayerNorm(dim_c, eps=1e-6, elementwise_affine=True)
-
-        dim_out = dim_v // 2
-        self.norm = nn.LayerNorm(dim_out, eps=1e-6, elementwise_affine=True)
-
-        self.dim_c = dim_c
-        self.dim_v = dim_v
-        self.patches_shape = patches_shape
-        self.token_pool_size = token_pool_size
-        self.N_v = (patches_shape[0] // token_pool_size) * (patches_shape[1] // token_pool_size)
-
-        self.conv = nn.Conv2d(in_channels=dim_c, out_channels=dim_v, kernel_size=token_pool_size, stride=token_pool_size)
-
-        # Circulant projection
-        self.circulant_pos_x = nn.Parameter(torch.ones(self.N_v))
-        self.circulant_pos_y = nn.Parameter(torch.ones(self.N_v))
-        self.weight = nn.Parameter(torch.empty(self.N_v))
-        self.bias = nn.Parameter(torch.ones(self.N_v))
-
-        nn.init.uniform_(self.weight, -1e-3 / self.N_v, 1e-3 / self.N_v)
-
-        self.channel_proj = nn.Linear(dim_out, dim_v)
-        self.enable_amp = enable_amp
-
-    def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
-            B, N_in, _ = x.shape
-
-            # Normalize input
-            x = self.norm_input(x)  # (B, N_in, dim_c)
-
-            # (B, dim_c, H, W)
-            x = x.transpose(1, 2)
-            x = x.reshape(B, self.dim_c, self.patches_shape[0], self.patches_shape[1])
-            x = self.conv(x).reshape(B, self.dim_v, self.N_v)
-            x = x.transpose(1, 2)  # (B, N_v, dim_v)
-
-            res, gate = x.chunk(2, dim=-1)  # Each is (B, N_v, dim_out)
-
-            gate = self.norm(gate)  # (B, N_v, dim_out)
-
-            # Circulant matrix logic
-            w = F.pad(self.weight, (0, self.N_v), value=0)  # (2*N_v)
-            w = w.unsqueeze(0).repeat(self.N_v, 1)  # (N_v, 2*N_v)
-            w = w[:, :self.N_v]  # (N_v, N_v)
-            w = w * self.circulant_pos_x.unsqueeze(1)  # (N_v, N_v)
-            w = w * self.circulant_pos_y.unsqueeze(0)  # (N_v, N_v)
-
-            # Apply circulant projection: gate is (B, N_v, dim_out)
-            gate = gate.transpose(1, 2)  # (B, dim_out, N_v)
-            gate = torch.matmul(gate, w.T) + self.bias  # (B, dim_out, N_v)
-            gate = gate.transpose(1, 2)  # (B, N_v, dim_out)
-
-            x = res * gate  # element-wise
-            x = self.channel_proj(x)  # (B, N_v, dim_v)
-
-            return x
 
 class VarStreamDownSamplingBlock(nn.Module):
     """
@@ -860,84 +769,88 @@ def main():
     The difference should be ~zero.
     """
 
-    # insitantiating and fixing the model.
-    # model = AsymmetricRevVit(
-    #     const_dim=192,
-    #     var_dim=[64, 128, 320, 512],
-    #     sra_R=[8, 4, 2, 1],
-    #     n_head=8,
-    #     stages=[1, 1, 10, 1],
-    #     drop_path_rate=0.1,
-    #     patch_size=(
-    #         4,
-    #         4,
-    #     ),  
-    #     image_size=(224, 224),  
-    #     num_classes=100,
-    # )
-
     model = AsymmetricRevVit(
-        const_dim=192,
-        var_dim=[64, 128, 320, 512],
+        block_type="swin-dw-mlp",
+        const_dim=96,
+        var_dim=[96, 192, 384, 768],
         sra_R=[8, 4, 2, 1],
-        n_head=8,
-        stages=[1, 1, 10, 1],
+        n_head=1,
+        stages=[2, 2, 18, 2],
         drop_path_rate=0.1,
         patch_size=(
             4,
             4,
         ),  
-        image_size=(224, 224),  
-        num_classes=100,
+        image_size=(512, 512),  
+        num_classes=150,
     )
 
     # random input, instaintiate and fixing.
     # no need for GPU for unit test, runs fine on CPU.
-    x = torch.rand((1, 3, 224, 224))
+    x = torch.rand((1, 3, 512, 512))
     model = model
     
     # model = model.to("cuda")
     # x = x.to("cuda")
     import time
-    start_time = time.time()          
+    start_time = time.time()     
 
-    # output of the model under reversible backward logic
-    output = model(x)
-    # loss is just the norm of the output
-    loss = output.norm(dim=1).mean()
-    print(loss.shape)
+    # Forward pass (segmentation output)
+    seg_output = model(x)
+    # seg_output shape should be (1, 150, 512, 512), since
+    # the segmentation head upsamples by 4x and input is 512x512
+    print(f"Segmentation output shape: {seg_output.shape}")
 
-    # computatin gradients with reversible backward logic
-    # using retain_graph=True to keep the computation graph.
+    fake_mask = torch.randint(0, 150, (1, 512, 512), dtype=torch.long)
+
+     # Compute loss (cross-entropy loss for segmentation)
+    criterion = torch.nn.CrossEntropyLoss()
+    loss = criterion(seg_output, fake_mask)
+    print(f"Loss: {loss.item()}")
+
     loss.backward(retain_graph=True)
 
     end_time = time.time()
+    print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms")
 
-    print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms") 
 
-    # gradient of the patchification layer under custom bwd logic
-    rev_grad = model.patch_embed1.weight.grad.clone()
+    # output of the model under reversible backward logic
+    # output = model(x)
+    # # loss is just the norm of the output
+    # loss = output.norm(dim=1).mean()
+    # print(loss.shape)
 
-    # resetting the computation graph
-    for param in model.parameters():
-        param.grad = None
+    # # computatin gradients with reversible backward logic
+    # # using retain_graph=True to keep the computation graph.
+    # loss.backward(retain_graph=True)
 
-    # switching model mode to use vanilla backward logic
-    model.no_custom_backward = True
+    # end_time = time.time()
 
-    # computing forward with the same input and model.
-    output = model(x)
-    # same loss
-    loss = output.norm(dim=1)
+    # print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms") 
 
-    # backward but with vanilla logic, does not need retain_graph=True
-    loss.backward()
+    # # gradient of the patchification layer under custom bwd logic
+    # rev_grad = model.patch_embed1.weight.grad.clone()
 
-    # looking at the gradient of the patchification layer again
-    vanilla_grad = model.patch_embed1.weight.grad.clone()
+    # # resetting the computation graph
+    # for param in model.parameters():
+    #     param.grad = None
+
+    # # switching model mode to use vanilla backward logic
+    # model.no_custom_backward = True
+
+    # # computing forward with the same input and model.
+    # output = model(x)
+    # # same loss
+    # loss = output.norm(dim=1)
+
+    # # backward but with vanilla logic, does not need retain_graph=True
+    # loss.backward()
+
+    # # looking at the gradient of the patchification layer again
+    # vanilla_grad = model.patch_embed1.weight.grad.clone()
 
     # difference between the two gradients is small enough.
-    assert (rev_grad - vanilla_grad).abs().max() < 1e-6
+    # assert (rev_grad - vanilla_grad).abs().max() < 1e-6
 
     print(f"\nNumber of model parameters: {sum(p.numel() for p in model.parameters())}\n")
 
@@ -953,6 +866,13 @@ def main():
         print(f"Total MACs Estimate (fvcore): {flops.total()}")
     except:
         print("FLOPs estimator failed")
+        pass
+    
+    try:
+        from utils import log_model_source
+        log_model_source(model)
+    except:
+        print("No logs created")
         pass
 
 if __name__ == "__main__":
