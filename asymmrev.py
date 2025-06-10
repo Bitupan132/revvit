@@ -797,6 +797,29 @@ def main():
 
     # Forward pass (segmentation output)
     seg_output = model(x)
+
+    if hasattr(model, 'feature_maps'):
+        print("\nVerifying feature maps at each stage:")
+        B = x.shape[0]
+        h4, w4 = x.shape[2] // 4, x.shape[3] // 4
+
+        for i, fm in enumerate(model.feature_maps):
+            # Each fm is (B, N, 96) where N = h4 * w4
+            print(f"Stage {i+1} feature map shape: {fm.shape}")
+
+            # Optionally, reshape to spatial (B, 96, h4, w4) for visualization
+            spatial_fm = fm.reshape(B, h4, w4, -1).permute(0, 3, 1, 2)  # (B, 96, h4, w4)
+            print(f"Stage {i+1} spatial feature map shape: {spatial_fm.shape}")
+
+            # For visualization: print a sample channel (first channel of first batch)
+            sample = spatial_fm[0, 0].detach().numpy()
+            print(f"Stage {i+1} sample channel min/max: {sample.min():.2f}, {sample.max():.2f}")
+            # plt.imshow(sample, cmap='gray')
+            # plt.title(f"Stage {i+1} Feature Map (Channel 0)")
+            # plt.axis('off')
+            # plt.show()
+            
+
     # seg_output shape should be (1, 150, 512, 512), since
     # the segmentation head upsamples by 4x and input is 512x512
     print(f"Segmentation output shape: {seg_output.shape}")
