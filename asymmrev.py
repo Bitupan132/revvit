@@ -183,7 +183,7 @@ class AsymmetricRevVit(nn.Module):
 
         # New segmentation components
         self.seg_head = nn.Sequential(
-            nn.Conv2d(96, num_classes, kernel_size=1), # 150 for ADE20K
+            nn.Conv2d(self.const_dim, num_classes, kernel_size=1), # 150 for ADE20K
             nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
         )
         self.feature_maps = [] # To store stage outputs
@@ -266,16 +266,15 @@ class AsymmetricRevVit(nn.Module):
         w4 = x.shape[3] // 4
 
         features_reshaped = [
-            fm.transpose(1, 2).reshape(B, 96, h4, w4)
+            fm.transpose(1, 2).reshape(B, self.const_dim, h4, w4)
             for fm in self.feature_maps
         ]
         fused_feature = torch.stack(features_reshaped, dim=0).sum(dim=0)  # (B, 96, H/4, W/4)
 
         # Segmentation head
         seg_logits = self.seg_head(fused_feature)  # (B, 150, H, W)
-        segmentation = torch.softmax(seg_logits, dim=1)
-
-        return segmentation
+    
+        return seg_logits
     
 class RevBackProp(Function):
 
@@ -788,7 +787,7 @@ def main():
     # random input, instaintiate and fixing.
     # no need for GPU for unit test, runs fine on CPU.
     x = torch.rand((1, 3, 512, 512))
-    model = model
+    # model = model
     
     # model = model.to("cuda")
     # x = x.to("cuda")
@@ -822,7 +821,9 @@ def main():
 
     # seg_output shape should be (1, 150, 512, 512), since
     # the segmentation head upsamples by 4x and input is 512x512
+    output_seg_probs = torch.softmax(seg_output, dim=1)
     print(f"Segmentation output shape: {seg_output.shape}")
+    print(f"Segmentation output probabilites shape: {output_seg_probs.shape}")
 
     fake_mask = torch.randint(0, 150, (1, 512, 512), dtype=torch.long)
 
